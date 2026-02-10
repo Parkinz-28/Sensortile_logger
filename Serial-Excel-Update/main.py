@@ -53,8 +53,10 @@ class SensorLogger:
         self.running = False
         self.stop_event = Event()
         self.sample_count = 0
+        self.last_email_count = 0  # Track last emailed sample count
         self.mode = None  # 'raw' or 'reduced'
         self.csv_initialized = False
+        self.data_buffer = []  # Buffer for incremental email
         
     def find_sensortile(self):
         """Auto-detect SensorTile USB port."""
@@ -86,49 +88,81 @@ class SensorLogger:
         print(f"[CSV] Headers: {headers}")
     
     def write_sample(self, row):
-        """Write a sample to CSV."""
+        """Write a sample to CSV and buffer for email."""
         self.csv_writer.writerow(row)
+        self.data_buffer.append(row)  # Keep for incremental email
         self.sample_count += 1
         if self.sample_count % 500 == 0:
             self.csv_file.flush()
             print(f"[LOG] {self.sample_count} samples")
     
     def send_email(self):
-        """Send CSV file via email to all recipients."""
+        """Send incremental CSV data via email."""
         if not EMAIL_ENABLED or not RECIPIENT_EMAILS:
             return
         
+        # Check if there's new data since last email
+        new_samples = len(self.data_buffer)
+        if new_samples == 0:
+            print("[EMAIL] No new data to send")
+            return
+        
         try:
+            # Create incremental CSV file
+            start_sample = self.last_email_count + 1
+            end_sample = self.sample_count
+            incremental_filename = f"sensor_data_{start_sample}-{end_sample}.csv"
+            
+            with open(incremental_filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                # Write headers
+                if self.mode == 'raw':
+                    headers = ["x", "y", "z"] + [f"m{i+1}" for i in range(16)] + ["timestamp"]
+                else:
+                    headers = ["x", "y", "z", "mic_peak", "mic_avg", "timestamp"]
+                writer.writerow(headers)
+                # Write buffered data
+                for row in self.data_buffer:
+                    writer.writerow(row)
+            
             msg = MIMEMultipart()
             msg['From'] = SENDER_EMAIL
             msg['To'] = ", ".join(RECIPIENT_EMAILS)
-            msg['Subject'] = f"SensorTile Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            msg['Subject'] = f"SensorTile Report [{start_sample}-{end_sample}] - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             
-            body = f"""SensorTile Data Report
+            body = f"""SensorTile Incremental Data Report
             
 Generated: {datetime.now().isoformat()}
-Mode: {self.mode.upper()}
-Samples: {self.sample_count}
-File: {CSV_FILENAME}
+Mode: {self.mode.upper() if self.mode else 'Unknown'}
+Sample Range: {start_sample} - {end_sample}
+New Samples: {new_samples}
+Total Samples: {self.sample_count}
 """
             msg.attach(MIMEText(body, 'plain'))
             
-            # Attach CSV
-            if os.path.exists(CSV_FILENAME):
-                with open(CSV_FILENAME, 'rb') as f:
-                    part = MIMEBase('application', 'octet-stream')
-                    part.set_payload(f.read())
-                    encoders.encode_base64(part)
-                    part.add_header('Content-Disposition', 
-                                    f'attachment; filename="{CSV_FILENAME}"')
-                    msg.attach(part)
+            # Attach incremental CSV
+            with open(incremental_filename, 'rb') as f:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', 
+                                f'attachment; filename="{incremental_filename}"')
+                msg.attach(part)
             
             server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.send_message(msg)
             server.quit()
-            print(f"[EMAIL] Sent to {len(RECIPIENT_EMAILS)} recipient(s)")
+            
+            # Clear buffer and update counter after successful send
+            self.last_email_count = self.sample_count
+            self.data_buffer.clear()
+            
+            # Remove temp file
+            os.remove(incremental_filename)
+            
+            print(f"[EMAIL] Sent samples {start_sample}-{end_sample} to {len(RECIPIENT_EMAILS)} recipient(s)")
             
         except Exception as e:
             print(f"[EMAIL] Failed: {e}")
